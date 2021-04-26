@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Wordpress on EC2
+
+Parameters:
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t3a.medium
+    AllowedValues:
+      - t2.medium
+      - t2.large
+      - t2.large
+      - t3a.small
+      - t3a.medium
+      - t3a.large      
+      - t3a.xlarge
+      - m1.small
+      - m1.medium
+      - m1.large
+      - m1.xlarge
+      - m2.xlarge
+      - m2.2xlarge
+      - m2.4xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - m5.large
+      - m5.xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  WindowsVersion:
+    AllowedValues:
+    - Windows Server 2019 English 64-bit
+    - Windows Server 2016 English 64-bit
+    - Windows Server 2012 R2 English 64-bit
+    - Windows Server 2012 RTM English 64-bit
+    - Windows Server 2019 R2 English 64-bit
+    Description: Select the Windows version
+    Type: String
+    Default: Windows Server 2019 English 64-bit  
+
+  OperatorEMail:
+    Description: EMail address to notify if there are any scaling operations
+    Type: String
+    AllowedPattern: >-
+      ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    ConstraintDescription: must be a valid email address.
+    Default: gershon.alvais@testproject.io
+
+  VPNSourceGroup:
+    Description: The security group that you want to allow VPN access to web instances. This should be the security group of your VPN 
+    Type: AWS::EC2::SecurityGroup::Id
+
+  WebSubnets:
+    Description: A list of subnets to use when launching EC2 web instances (Choose Public)
+    Type: List<AWS::EC2::Subnet::Id>
+
+  Vpc:
+    AllowedPattern: ^(vpc-)([a-z0-9]{8}|[a-z0-9]{17})$
+    Description: The Vpc Id of an existing VPC to launch this stack in.
+    Type: AWS::EC2::VPC::Id
+
+  EC2KeyName:
+    AllowedPattern: ^([a-zA-Z0-9 @.`~!#$%^&*()_+,\\-])*$
+    ConstraintDescription: Must be letters (upper or lower), numbers, and special characters.
+    Description: Name of an EC2 KeyPair. Your Web instances will launch with this KeyPair.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  RDPAccess:
+    Description: The IP address range that can be used to RDP to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.    
+    
+Mappings:
+  AWSRegion2AMI:
+    us-east-1:
+      WindowsServer2019: ami-0f5761c546ea1265a
+    us-east-2:
+      WindowsServer2019: ami-00d1b5cc1e5341681     
+    us-west-1:
+      WindowsServer2019: ami-04e7f4a09f5c3d6ce
+    eu-west-1:
+      WindowsServer2019: ami-0a262e3ac12949132
+
+Resources:
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: ec2-website-autoscalingroup
+      Subscription:
+        - Endpoint: !Ref OperatorEMail
+          Protocol: email
+
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecGroup # Only from ELB
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LoadBalancerSecGroup # Only from ELB          
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref RDPAccess          
+      VpcId: !Ref Vpc
+
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref WebInstanceRole
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: logs
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource:
+            - arn:aws:logs:*:*:*  
+
+  LoadBalancerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer only allow http/https
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0  
+          
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Properties:
+      SecurityGroups:
+        - !Ref LoadBalancerSecGroup
+      Subnets:
+        - !ImportValue PublicSubnet1
+        - !ImportValue PublicSubnet2  
+      CrossZone: true
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          Protocol: HTTP
+          # ToDo
+#        - LoadBalancerPort: '443'
+#          InstancePort: '443'
+#          Protocol: HTTPS          
+      HealthCheck:
+        Target: 'HTTP:80/'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      Cooldown: '600'
+      HealthCheckGracePeriod: 1200
+      HealthCheckType: ELB
+      MaxSize: '3'
+      MinSize: '1'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: !Ref WebSubnets
+      LoadBalancerNames:
+        - !Ref LoadBalancer  
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: 1
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: capacity-optimized
+        LaunchTemplate:
+          LaunchTemplateSpecification: 
+            LaunchTemplateId: !Ref WinServerLaunchTemplate
+            Version: !GetAtt WinServerLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: t2.medium
+            - InstanceType: t2.large
+            - InstanceType: t3a.medium
+            - InstanceType: t3a.large
+      NotificationConfigurations: 
+        - TopicARN: !Ref NotificationTopic
+          NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+            - autoscaling:TEST_NOTIFICATION      
+         
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: '1'
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  WinServerLaunchTemplate:
+      Type: AWS::EC2::LaunchTemplate
+      Metadata:
+        'AWS::CloudFormation::Init':
+          configSets:
+            ascending:
+              - install_cfn # AWS CloudFormation helper  that uses to install software and start services on an Amazon EC2 instance
+              - install_app # Installing IIS
+              - restart 
+              - send_signal
+          install_cfn:
+            files:
+              'c:\cfn\cfn-hup.conf': # the configuration file for cfn-hup
+                content: !Sub |
+                  [main]
+                  stack=${AWS::StackId}
+                  region=${AWS::Region}
+              'c:\cfn\hooks.d\cfn-auto-reloader.conf': # the configuration file for the hook used by cfn-hup to initiate an update (calling cfn-init) when the metadata in AWS::CloudFormation::Init changes
+                content: !Sub |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.WinServerLaunchTemplate.Metadata.AWS::CloudFormation::Init
+                  action=cfn-init.exe -v --stack ${AWS::StackId} --resource WinServerLaunchTemplate --configsets ascending --region ${AWS::Region}
+            services:
+              windows:
+                cfn-hup:
+                  enabled: 'true'
+                  ensureRunning: 'true'
+                  files:
+                    - 'c:\cfn\cfn-hup.conf'
+                    - 'c:\cfn\hooks.d\cfn-auto-reloader.conf'   
+          install_app:
+            files:
+              'c:\scripts\iis-install.ps1':
+                content: !Join
+                  - ''
+                  - - |
+                      Install-WindowsFeature -name Web-Server -IncludeManagementTools 
+                      New-SelfSignedCertificate -dnsname test.com -KeyLength 2048 -CertStoreLocation cert:\LocalMachine\My -NotAfter (Get-Date).AddYears(20)
+            commands:
+              01-install-iis:
+                command: powershell.exe -ExecutionPolicy Unrestricted c:\scripts\iis-install.ps1
+                waitAfterCompletion: '0'  
+              02-add-port-443-bidding:
+                command: powershell.exe New-WebBinding -Name 'Default Web Site' -IPAddress "*" -Port 443 -HostHeader "TestSite" -Protocol "https"              
+              RecycleAppPool:
+                command: >-
+                  C:\windows\System32\inetsrv\appcmd.exe recycle apppool
+                  DefaultAppPool              
+                                                          
+          restart:
+            commands:
+              0-restart:
+                command: powershell.exe -Command Restart-Computer
+                waitAfterCompletion: forever         
+          send_signal:
+            commands:        
+              signal-resource:
+                  command: !Sub >
+                    cfn-signal.exe -e %ERRORLEVEL% --resource WebAutoScalingGroup --stack ${AWS::StackId} --region ${AWS::Region} 
+      Properties:
+        LaunchTemplateData: 
+          BlockDeviceMappings:
+            - DeviceName: /dev/sda1
+              Ebs:
+                DeleteOnTermination: true
+                VolumeSize: 30 # 30GB is the minimum
+                VolumeType: gp2
+          EbsOptimized: true        
+          CreditSpecification: 
+            CpuCredits: unlimited
+          ImageId:
+            Fn::FindInMap:
+            - AWSRegion2AMI
+            - Ref: AWS::Region
+            - WindowsServer2019
+          InstanceType: !Ref InstanceType
+          IamInstanceProfile:
+            Arn: !GetAtt WebInstanceProfile.Arn
+          Monitoring: 
+            Enabled: true
+          SecurityGroupIds:
+            - !GetAtt WebSecurityGroup.GroupId  
+          KeyName: !Ref EC2KeyName        
+          UserData:
+            Fn::Base64: !Sub |
+              <script>
+              cfn-init.exe -v -s ${AWS::StackId} -r WinServerLaunchTemplate  --configsets ascending --region ${AWS::Region}
+              </script> 
+          TagSpecifications:
+            - ResourceType: instance
+              Tags:
+              - Key: Name
+                Value: !Sub '${AWS::Region}.ec2-instance.${AWS::StackName}.hdb' 
+  WebServerScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      Cooldown: '60'
+      ScalingAdjustment: 1
+  
+  WebServerScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      Cooldown: '60'
+      ScalingAdjustment: -1
+      
+  CPUAlarmHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      AlarmActions:
+        - !Ref WebServerScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAutoScalingGroup
+      ComparisonOperator: GreaterThanThreshold
+ 
+  CPUAlarmLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      AlarmActions:
+        - !Ref WebServerScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAutoScalingGroup
+      ComparisonOperator: LessThanThreshold
+      
+Outputs:
+#  TargetGroup: 
+#    Value: !Ref PublicAlbTargetGroup
+#    Export:
+#      Name: TargetGroup     
+  WindowsVersion:
+    Description: Amazon EC2 instance Windows Version
+    Value: !Ref WindowsVersion   
+  URL:
+    Description: The URL of the website
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - LoadBalancer
+          - DNSName
